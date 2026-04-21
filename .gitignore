@@ -1,2 +1,3 @@
 venv/
-"streaming(pi)/gxipy/__pycache__/""
+"streaming(pi)/gxipy/__pycache__/"
+__pycache__/
