@@ -6,61 +6,68 @@ from http import server
 import socketserver
 import numpy as np
 
-# Import the perfected camera module we just built
+# Import the perfected camera module
 from camera import StereoCamera
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # ── Shared Memory & Synchronization ───────────────────────────────────────
-# This holds the compressed JPEG bytes.
-latest_jpeg_bytes = None
-# This condition notifies the network threads the exact microsecond a frame is ready.
-jpeg_condition = threading.Condition()
+# Independent byte buffers for each eye
+latest_jpeg_left = None
+latest_jpeg_right = None
+
+# A single condition variable to synchronize ALL active network streams instantly
+frame_condition = threading.Condition()
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Suppress standard HTTP logging so it doesn't spam the Pi's terminal
+        # Suppress standard HTTP logging to keep the Pi's terminal clean
         pass
 
     def do_GET(self):
-        global latest_jpeg_bytes
+        global latest_jpeg_left, latest_jpeg_right
         
-        if self.path == '/stream.mjpg':
-            # 1. Standard MJPEG HTTP Headers
-            self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            # Boundary defines where one frame ends and the next begins
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-            self.end_headers()
-            
-            try:
-                while True:
-                    # 2. Wait for the hardware to tick
-                    with jpeg_condition:
-                        jpeg_condition.wait()
-                        frame_data = latest_jpeg_bytes
-                        
-                    if frame_data is None:
-                        continue
-                        
-                    # 3. Blast the JPEG bytes over the Ethernet socket
-                    self.wfile.write(b'--FRAME\r\n')
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.send_header('Content-Length', len(frame_data))
-                    self.end_headers()
-                    self.wfile.write(frame_data)
-                    self.wfile.write(b'\r\n')
-                    
-            except Exception:
-                # Client disconnected (GUI closed, page refreshed, or Ethernet cable pulled)
-                logging.info(f"Client disconnected from stream: {self.client_address}")
-                return
+        # Route the request to the correct memory buffer
+        if self.path == '/stream_left.mjpg':
+            stream_target = 'left'
+        elif self.path == '/stream_right.mjpg':
+            stream_target = 'right'
         else:
             self.send_error(404)
             self.end_headers()
+            return
+            
+        # Standard MJPEG HTTP Headers
+        self.send_response(200)
+        self.send_header('Age', 0)
+        self.send_header('Cache-Control', 'no-cache, private')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+        self.end_headers()
+        
+        try:
+            while True:
+                # Wait for the hardware to tick
+                with frame_condition:
+                    frame_condition.wait()
+                    # Grab the correct frame based on the requested URL
+                    frame_data = latest_jpeg_left if stream_target == 'left' else latest_jpeg_right
+                    
+                if frame_data is None:
+                    continue
+                    
+                # Blast the JPEG bytes over the Ethernet socket
+                self.wfile.write(b'--FRAME\r\n')
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', len(frame_data))
+                self.end_headers()
+                self.wfile.write(frame_data)
+                self.wfile.write(b'\r\n')
+                
+        except Exception:
+            logging.info(f"Client disconnected from {stream_target} stream: {self.client_address}")
+            return
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, server.HTTPServer):
@@ -69,13 +76,11 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, server.HTTPServer):
 
 
 def start_network_server(port=8083):
-    # Binding to '0.0.0.0' exposes the server to the Ethernet interface 
-    # so the Windows laptop can connect via 192.168.137.65
     server_address = ('0.0.0.0', port)
     httpd = ThreadedHTTPServer(server_address, StreamingHandler)
-    logging.info(f"MJPEG Stream Server actively broadcasting on http://0.0.0.0:{port}/stream.mjpg")
+    logging.info(f"Left Stream:  http://0.0.0.0:{port}/stream_left.mjpg")
+    logging.info(f"Right Stream: http://0.0.0.0:{port}/stream_right.mjpg")
     
-    # Run the server in a background thread
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     return httpd
@@ -88,14 +93,12 @@ def start_network_server(port=8083):
 if __name__ == "__main__":
     camera_instance = None
     try:
-        # Start the network server immediately on port 8083
         start_network_server(port=8083)
         
         logging.info("Initializing Stereo Hardware...")
         TARGET_FPS = 30.0
         TARGET_FRAME_TIME = 1.0 / TARGET_FPS
         
-        # NOTE: On the Pi, camera_device_index might be 0 instead of 1.
         camera_instance = StereoCamera(
             camera_device_index=1,
             hardware_width=2560,
@@ -115,35 +118,40 @@ if __name__ == "__main__":
             left, right = camera_instance.retrieve_synchronized_stereo_frames()
 
             if left is not None and right is not None:
-                # 2. Stitch and resize for the GUI
-                # Resizing to 1280x360 keeps the stream high-def but prevents 
-                # saturating the Pi's CPU with massive JPEG encoding loads.
-                display = np.concatenate([left, right], axis=1)
-                display = cv2.resize(display, (1280, 360), interpolation=cv2.INTER_LINEAR)
+                # 2. Resize each eye individually
+                # Scaling down slightly from native 1280x720 to 640x360 keeps the stream high-def 
+                # but ensures dual-encoding doesn't throttle the Pi's CPU.
+                left_disp = cv2.resize(left, (640, 360), interpolation=cv2.INTER_LINEAR)
+                right_disp = cv2.resize(right, (640, 360), interpolation=cv2.INTER_LINEAR)
 
-                # Add the FPS overlay directly onto the stream so the GUI team can verify performance
-                cv2.putText(display, f"Server FPS: {fps_smoothed:.1f} (LOCKED)",
-                            (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
+                # Add independent FPS overlays
+                cv2.putText(left_disp, f"L-FPS: {fps_smoothed:.1f}",
+                            (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(right_disp, f"R-FPS: {fps_smoothed:.1f}",
+                            (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
 
                 # 3. Hardware-Accelerated JPEG Encoding
-                # Quality 80 is the perfect sweet spot for MJPEG streams (low latency, high clarity)
-                ret, jpeg_encoded = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                ret_l, jpeg_encoded_left = cv2.imencode('.jpg', left_disp, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                ret_r, jpeg_encoded_right = cv2.imencode('.jpg', right_disp, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                
+                if ret_l and ret_r:
+                    # 4. Atomically update the shared memory and instantly wake up all network sockets
+                    with frame_condition:
+                        latest_jpeg_left = jpeg_encoded_left.tobytes()
+                        latest_jpeg_right = jpeg_encoded_right.tobytes()
+                        frame_condition.notify_all()
+            else:
+                # If camera disconnects, stream warning images to both endpoints
+                blank = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "CONNECTION LOST",
+                            (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+                ret, jpeg_encoded = cv2.imencode('.jpg', blank, [cv2.IMWRITE_JPEG_QUALITY, 50])
                 
                 if ret:
-                    # 4. Atomically update the shared memory and instantly wake up the network socket
-                    with jpeg_condition:
-                        latest_jpeg_bytes = jpeg_encoded.tobytes()
-                        jpeg_condition.notify_all()
-            else:
-                # If camera disconnects, stream a warning image to the GUI
-                blank = np.zeros((360, 1280, 3), dtype=np.uint8)
-                cv2.putText(blank, "ROV CAMERA CONNECTION LOST",
-                            (350, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
-                ret, jpeg_encoded = cv2.imencode('.jpg', blank, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                if ret:
-                    with jpeg_condition:
-                        latest_jpeg_bytes = jpeg_encoded.tobytes()
-                        jpeg_condition.notify_all()
+                    with frame_condition:
+                        latest_jpeg_left = jpeg_encoded.tobytes()
+                        latest_jpeg_right = jpeg_encoded.tobytes()
+                        frame_condition.notify_all()
 
             # 5. Precise Software Throttle (maintains exact 30 FPS)
             time_spent = time.perf_counter() - loop_start
