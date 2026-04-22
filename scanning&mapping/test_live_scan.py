@@ -23,8 +23,17 @@ class DummyDepth:
 if __name__ == "__main__":
     camera_instance = None
     try:
-        logging.info("Warming up Daheng Stereo Camera...")
-        camera_instance = StereoCamera(camera_device_index=0, hardware_width=2560, hardware_height=720, fps=30)
+        logging.info("Warming up standard laptop webcam (index 0) for testing...")
+        
+        # Using a standard 720p resolution that laptop webcams support.
+        # The StereoCamera architecture will slice this down the middle, 
+        # generating two 640x720 mock frames to stress-test the disk I/O queue!
+        camera_instance = StereoCamera(
+            camera_device_index=0, 
+            hardware_width=1280, 
+            hardware_height=720, 
+            fps=30
+        )
         
         scanner = AutonomousTransectScanner(
             target_storage_directory_path="./live_dive_data",
@@ -55,4 +64,4 @@ if __name__ == "__main__":
             scanner.stop_scanning_session()
         if camera_instance:
             camera_instance.release_stereo_camera_hardware()
-        logging.info("Check the 'live_dive_data' folder for your actual camera images and CSV!")
+        logging.info("Check the 'live_dive_data' folder for your webcam images and CSV!")
